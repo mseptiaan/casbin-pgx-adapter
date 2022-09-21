@@ -22,13 +22,14 @@ const (
 
 // Adapter represents the github.com/jackc/pgx/v4 adapter for policy storage.
 type Adapter struct {
-	pool            *pgxpool.Pool
-	tableName       string
-	dbName          string
-	schema          string
-	timeout         time.Duration
-	skipTableCreate bool
-	filtered        bool
+	pool               *pgxpool.Pool
+	tableName          string
+	dbName             string
+	schema             string
+	timeout            time.Duration
+	skipTableCreate    bool
+	skipDatabaseCreate bool
+	filtered           bool
 }
 
 type Filter struct {
@@ -50,7 +51,7 @@ func NewAdapter(conn interface{}, opts ...Option) (*Adapter, error) {
 		opt(a)
 	}
 
-	if a.pool == nil {
+	if a.pool == nil || !a.skipDatabaseCreate {
 		pool, err := createDatabase(a.dbName, conn)
 		if err != nil {
 			return nil, fmt.Errorf("pgxadapter.NewAdapter: %v", err)
@@ -85,6 +86,16 @@ func WithSkipTableCreate() Option {
 func WithDatabase(dbname string) Option {
 	return func(a *Adapter) {
 		a.dbName = dbname
+	}
+}
+
+// WithSkipDatabaseCreate skips the database creation step when the adapter starts
+// If the Casbin rules table does not exist, it will lead to issues when using the adapter
+func WithSkipDatabaseCreate() Option {
+	return func(a *Adapter) {
+		if a.pool != nil {
+			a.skipDatabaseCreate = true
+		}
 	}
 }
 
