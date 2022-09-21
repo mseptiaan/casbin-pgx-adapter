@@ -49,11 +49,15 @@ func NewAdapter(conn interface{}, opts ...Option) (*Adapter, error) {
 	for _, opt := range opts {
 		opt(a)
 	}
-	pool, err := createDatabase(a.dbName, conn)
-	if err != nil {
-		return nil, fmt.Errorf("pgxadapter.NewAdapter: %v", err)
+
+	if a.pool == nil {
+		pool, err := createDatabase(a.dbName, conn)
+		if err != nil {
+			return nil, fmt.Errorf("pgxadapter.NewAdapter: %v", err)
+		}
+		a.pool = pool
 	}
-	a.pool = pool
+
 	if !a.skipTableCreate {
 		if err := a.createTable(); err != nil {
 			return nil, fmt.Errorf("pgxadapter.NewAdapter: %v", err)
@@ -81,6 +85,13 @@ func WithSkipTableCreate() Option {
 func WithDatabase(dbname string) Option {
 	return func(a *Adapter) {
 		a.dbName = dbname
+	}
+}
+
+// WithPool can be used to using current database pool
+func WithConnectionPool(pool *pgxpool.Pool) Option {
+	return func(a *Adapter) {
+		a.pool = pool
 	}
 }
 
