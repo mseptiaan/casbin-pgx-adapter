@@ -2,17 +2,15 @@ package pgxadapter
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/casbin/casbin/v2/model"
 	"github.com/casbin/casbin/v2/persist"
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgtype"
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgtype"
+	"github.com/jackc/pgx/v4"
+	"github.com/jackc/pgx/v4/pgxpool"
 	"github.com/mmcloughlin/meow"
 )
 
@@ -22,15 +20,16 @@ const (
 	DefaultTimeout      = time.Second * 10
 )
 
-// Adapter represents the github.com/jackc/pgx/v5 adapter for policy storage.
+// Adapter represents the github.com/jackc/pgx/v4 adapter for policy storage.
 type Adapter struct {
-	pool            *pgxpool.Pool
-	tableName       string
-	dbName          string
-	schema          string
-	timeout         time.Duration
-	skipTableCreate bool
-	filtered        bool
+	pool               *pgxpool.Pool
+	tableName          string
+	dbName             string
+	schema             string
+	timeout            time.Duration
+	skipTableCreate    bool
+	skipDatabaseCreate bool
+	filtered           bool
 }
 
 type Filter struct {
@@ -41,7 +40,7 @@ type Filter struct {
 type Option func(a *Adapter)
 
 // NewAdapter creates a new adapter with connection conn which must either be a PostgreSQL
-// connection string or an instance of *pgx.ConnConfig from package github.com/jackc/pgx/v5.
+// connection string or an instance of *pgx.ConnConfig from package github.com/jackc/pgx/v4.
 func NewAdapter(conn interface{}, opts ...Option) (*Adapter, error) {
 	a := &Adapter{
 		dbName:    DefaultDatabaseName,
@@ -52,7 +51,7 @@ func NewAdapter(conn interface{}, opts ...Option) (*Adapter, error) {
 		opt(a)
 	}
 
-	if a.pool == nil {
+	if a.pool == nil || !a.skipDatabaseCreate {
 		pool, err := createDatabase(a.dbName, conn)
 		if err != nil {
 			return nil, fmt.Errorf("pgxadapter.NewAdapter: %v", err)
@@ -62,7 +61,6 @@ func NewAdapter(conn interface{}, opts ...Option) (*Adapter, error) {
 
 	if !a.skipTableCreate {
 		if err := a.createTable(); err != nil {
-			a.pool.Close()
 			return nil, fmt.Errorf("pgxadapter.NewAdapter: %v", err)
 		}
 	}
@@ -91,18 +89,28 @@ func WithDatabase(dbname string) Option {
 	}
 }
 
+// WithSkipDatabaseCreate skips the database creation step when the adapter starts
+// If the Casbin rules table does not exist, it will lead to issues when using the adapter
+func WithSkipDatabaseCreate() Option {
+	return func(a *Adapter) {
+		if a.pool != nil {
+			a.skipDatabaseCreate = true
+		}
+	}
+}
+
+// WithPool can be used to using current database pool
+func WithConnectionPool(pool *pgxpool.Pool) Option {
+	return func(a *Adapter) {
+		a.pool = pool
+	}
+}
+
 // WithTimeout can be used to pass a different timeout than DefaultTimeout
 // for each request to Postgres
 func WithTimeout(timeout time.Duration) Option {
 	return func(a *Adapter) {
 		a.timeout = timeout
-	}
-}
-
-// WithConnectionPool can be used to pass an existing *pgxpool.Pool instance
-func WithConnectionPool(pool *pgxpool.Pool) Option {
-	return func(a *Adapter) {
-		a.pool = pool
 	}
 }
 
@@ -137,7 +145,10 @@ func (a *Adapter) tableIdentifier() pgx.Identifier {
 }
 
 func (a *Adapter) schemaTable() string {
-	return a.tableIdentifier().Sanitize()
+	if a.schema != "" {
+		return fmt.Sprintf("%q.%s", a.schema, a.tableName)
+	}
+	return a.tableName
 }
 
 // LoadPolicy loads policy from database.
@@ -145,14 +156,16 @@ func (a *Adapter) LoadPolicy(model model.Model) error {
 	ctx, cancel := context.WithTimeout(context.Background(), a.timeout)
 	defer cancel()
 	var pType, v0, v1, v2, v3, v4, v5 pgtype.Text
-	rows, err := a.pool.Query(ctx, fmt.Sprintf(`SELECT "p_type", "v0", "v1", "v2", "v3", "v4", "v5" FROM %s`, a.schemaTable()))
-	if err != nil {
-		return err
-	}
-	_, err = pgx.ForEachRow(rows, []interface{}{&pType, &v0, &v1, &v2, &v3, &v4, &v5}, func() error {
-		persist.LoadPolicyLine(policyLine(pType.String, v0.String, v1.String, v2.String, v3.String, v4.String, v5.String), model)
-		return nil
-	})
+	_, err := a.pool.QueryFunc(
+		ctx,
+		fmt.Sprintf(`SELECT "p_type", "v0", "v1", "v2", "v3", "v4", "v5" FROM %s`, a.schemaTable()),
+		nil,
+		[]interface{}{&pType, &v0, &v1, &v2, &v3, &v4, &v5},
+		func(pgx.QueryFuncRow) error {
+			persist.LoadPolicyLine(policyLine(pType.String, v0.String, v1.String, v2.String, v3.String, v4.String, v5.String), model)
+			return nil
+		},
+	)
 	if err != nil {
 		return err
 	}
@@ -172,22 +185,22 @@ func policyArgs(ptype string, rule []string) []interface{} {
 	row := make([]interface{}, 8)
 	row[0] = pgtype.Text{
 		String: policyID(ptype, rule),
-		Valid:  true,
+		Status: pgtype.Present,
 	}
 	row[1] = pgtype.Text{
 		String: ptype,
-		Valid:  true,
+		Status: pgtype.Present,
 	}
 	l := len(rule)
 	for i := 0; i < 6; i++ {
 		if i < l {
 			row[2+i] = pgtype.Text{
 				String: rule[i],
-				Valid:  true,
+				Status: pgtype.Present,
 			}
 		} else {
 			row[2+i] = pgtype.Text{
-				Valid: false,
+				Status: pgtype.Null,
 			}
 		}
 	}
@@ -210,7 +223,7 @@ func (a *Adapter) SavePolicy(model model.Model) error {
 
 	ctx, cancel := context.WithTimeout(context.Background(), a.timeout)
 	defer cancel()
-	return pgx.BeginFunc(ctx, a.pool, func(tx pgx.Tx) error {
+	return a.pool.BeginFunc(ctx, func(tx pgx.Tx) error {
 		_, err := tx.Exec(context.Background(), fmt.Sprintf("DELETE FROM %s WHERE id IS NOT NULL", a.schemaTable()))
 		if err != nil {
 			return err
@@ -228,7 +241,7 @@ func (a *Adapter) SavePolicy(model model.Model) error {
 func (a *Adapter) insertPolicyStmt() string {
 	return fmt.Sprintf(`
 		INSERT INTO %s (id, p_type, v0, v1, v2, v3, v4, v5)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT (id) DO NOTHING
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 	`, a.schemaTable())
 }
 
@@ -247,16 +260,16 @@ func (a *Adapter) AddPolicy(sec string, ptype string, rule []string) error {
 func (a *Adapter) AddPolicies(sec string, ptype string, rules [][]string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), a.timeout)
 	defer cancel()
-	return pgx.BeginFunc(ctx, a.pool, func(tx pgx.Tx) error {
+	return a.pool.BeginFunc(ctx, func(tx pgx.Tx) error {
 		b := &pgx.Batch{}
 		for _, rule := range rules {
 			b.Queue(a.insertPolicyStmt(), policyArgs(ptype, rule)...)
 		}
 		br := tx.SendBatch(context.Background(), b)
+		defer br.Close()
 		for range rules {
 			_, err := br.Exec()
 			if err != nil {
-				br.Close()
 				return err
 			}
 		}
@@ -280,16 +293,17 @@ func (a *Adapter) RemovePolicy(sec string, ptype string, rule []string) error {
 func (a *Adapter) RemovePolicies(sec string, ptype string, rules [][]string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), a.timeout)
 	defer cancel()
-	return pgx.BeginFunc(ctx, a.pool, func(tx pgx.Tx) error {
+	return a.pool.BeginFunc(ctx, func(tx pgx.Tx) error {
 		b := &pgx.Batch{}
 		for _, rule := range rules {
-			b.Queue(fmt.Sprintf("DELETE FROM %s WHERE id = $1", a.schemaTable()), policyID(ptype, rule))
+			id := policyID(ptype, rule)
+			b.Queue(fmt.Sprintf("DELETE FROM %s WHERE id = $1", a.schemaTable()), id)
 		}
 		br := tx.SendBatch(context.Background(), b)
+		defer br.Close()
 		for range rules {
 			_, err := br.Exec()
 			if err != nil {
-				br.Close()
 				return err
 			}
 		}
@@ -365,11 +379,7 @@ func (a *Adapter) loadFilteredPolicy(model model.Model, filter *Filter, handler 
 
 	ctx, cancel := context.WithTimeout(context.Background(), a.timeout)
 	defer cancel()
-	rows, err := a.pool.Query(ctx, sb.String(), args...)
-	if err != nil {
-		return err
-	}
-	_, err = pgx.ForEachRow(rows, []interface{}{&ptype, &v0, &v1, &v2, &v3, &v4, &v5}, func() error {
+	_, err := a.pool.QueryFunc(ctx, sb.String(), args, []interface{}{&ptype, &v0, &v1, &v2, &v3, &v4, &v5}, func(qfr pgx.QueryFuncRow) error {
 		handler(policyLine(ptype.String, v0.String, v1.String, v2.String, v3.String, v4.String, v5.String), model)
 		return nil
 	})
@@ -408,19 +418,20 @@ func (a *Adapter) UpdatePolicy(sec string, ptype string, oldRule, newPolicy []st
 func (a *Adapter) UpdatePolicies(sec string, ptype string, oldRules, newRules [][]string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), a.timeout)
 	defer cancel()
-	return pgx.BeginFunc(ctx, a.pool, func(tx pgx.Tx) error {
+	return a.pool.BeginFunc(ctx, func(t pgx.Tx) error {
 		b := &pgx.Batch{}
 		for _, rule := range oldRules {
-			b.Queue(fmt.Sprintf("DELETE FROM %s WHERE id = $1", a.schemaTable()), policyID(ptype, rule))
+			id := policyID(ptype, rule)
+			b.Queue(fmt.Sprintf("DELETE FROM %s WHERE id = $1", a.schemaTable()), id)
 		}
 		for _, rule := range newRules {
 			b.Queue(a.insertPolicyStmt(), policyArgs(ptype, rule)...)
 		}
-		br := tx.SendBatch(context.Background(), b)
+		br := t.SendBatch(context.Background(), b)
+		defer br.Close()
 		for i := 0; i < b.Len(); i++ {
 			_, err := br.Exec()
 			if err != nil {
-				br.Close()
 				return err
 			}
 		}
@@ -443,30 +454,8 @@ func (a *Adapter) createTable() error {
 	if a.schema != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), a.timeout)
 		defer cancel()
-		if _, err := a.pool.Exec(ctx, fmt.Sprintf(`CREATE SCHEMA IF NOT EXISTS %s`, pgx.Identifier{a.schema}.Sanitize())); err != nil {
+		if _, err := a.pool.Exec(ctx, fmt.Sprintf(`CREATE SCHEMA IF NOT EXISTS %q`, a.schema)); err != nil {
 			return err
-		}
-	}
-	lowerTableName := strings.ToLower(a.tableName)
-	if a.tableName != DefaultTableName && lowerTableName != a.tableName {
-		ident := pgx.Identifier{lowerTableName}
-		if a.schema != "" {
-			ident = pgx.Identifier{a.schema, lowerTableName}
-		}
-		exists := false
-		ctx, cancel := context.WithTimeout(context.Background(), a.timeout)
-		defer cancel()
-		if err := a.pool.QueryRow(ctx, fmt.Sprintf(
-			"SELECT EXISTS (SELECT COUNT(*) FROM (SELECT FROM %s LIMIT 1) a)",
-			ident.Sanitize()),
-		).Scan(&exists); err != nil {
-			var pgErr *pgconn.PgError
-			if !errors.As(err, &pgErr) || pgErr.Code != "42P01" {
-				return err
-			}
-		}
-		if exists {
-			return fmt.Errorf("found table with similar name only in lower case: %q. Either use this table name exactly, or choose a different name", lowerTableName)
 		}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), a.timeout)
@@ -513,7 +502,7 @@ func createDatabase(dbname string, arg interface{}) (*pgxpool.Pool, error) {
 	rows.Close()
 
 	if createdb {
-		_, err = conn.Exec(ctx, "CREATE DATABASE "+pgx.Identifier{dbname}.Sanitize())
+		_, err = conn.Exec(ctx, "CREATE DATABASE "+dbname)
 		if err != nil {
 			return nil, err
 		}
@@ -543,5 +532,5 @@ func createDatabase(dbname string, arg interface{}) (*pgxpool.Pool, error) {
 		return nil, err
 	}
 	cfg.ConnConfig.Database = dbname
-	return pgxpool.NewWithConfig(ctx, cfg)
+	return pgxpool.ConnectConfig(ctx, cfg)
 }

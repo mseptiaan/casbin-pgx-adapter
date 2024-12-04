@@ -41,4 +41,3 @@ _testmain.go
 *.out
 
 .env
-.envrc
